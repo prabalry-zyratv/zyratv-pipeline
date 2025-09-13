@@ -48,6 +48,18 @@ jobs:
           pip install -r requirements.txt
           pip install google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
 
+      - name: Show package versions
+        run: |
+          python - << 'PY'
+          import moviepy, PIL, numpy, imageio
+          import PIL.Image
+          print("moviepy:", moviepy.__version__)
+          print("Pillow:", PIL.__version__)
+          print("NumPy:", numpy.__version__)
+          print("imageio:", imageio.__version__)
+          print("Has PIL.Image.ANTIALIAS:", hasattr(PIL.Image, "ANTIALIAS"))
+          PY
+      
       - name: Print env & Python info
         run: |
           python -V
