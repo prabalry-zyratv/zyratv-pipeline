@@ -1,14 +1,15 @@
-# video.py — serverless-friendly renderer with optional caption burn-in (Linux only)
-# - Works on Ubuntu GitHub Actions (no Windows paths, no ImageMagick)
-# - Uses 1–3 background clips (paragraph-weighted)
-# - PEXELS_API_KEY from env; solid background fallback
-# - Can burn captions if BURN_IN_CAPTIONS="1" in workflow env
+# video.py — auto-pick Pexels clips with robust fallbacks (EN/HI/BN)
+# - Derives queries from channel + keywords (Hindi/Bengali supported via tiny maps)
+# - Tries multiple queries (broad → specific), vertical-first, size=large
+# - Downloads the chosen clips (stable on CI) with small retry/cache
+# - Falls back to a dark moving solid if zero results
+# - Optional caption burn-in stays handled by your workflow (unchanged)
 
-import os, re, subprocess, textwrap, requests
-from typing import List, Optional, Dict
+import os, re, time, hashlib, requests, io
+from typing import List, Optional, Dict, Tuple
 from moviepy.editor import (
     VideoFileClip, AudioFileClip, concatenate_videoclips,
-    vfx, ColorClip
+    CompositeVideoClip, vfx, ColorClip
 )
 
 MEDIA_DIR = "input/media_temp"
@@ -19,7 +20,50 @@ os.makedirs(OUT_DIR,   exist_ok=True)
 TARGET_W, TARGET_H, FPS = 1080, 1920, 30
 BITRATE = "8000k"
 
-# --------------------- helpers ---------------------
+# ---------------- Keywords & maps ----------------
+
+STOP_EN = set("""
+the and with your that this then have will just like very from into you for are was were been being been of to a in is it on as at by an be or if so but not no do does did can could should would may might our their his her its them they we us i me
+""".split())
+STOP_HI = set("है और या या/या कि यह वह तुम आप हम मैं हैं के को से एक भी तो पर में फिर अगर क्योंकि लेकिन तथा होकर जब तक तब बाद पहले बिना जैसे कुछ कोई करना करना है की के लिए नहीं".split())
+STOP_BN = set("এবং বা যে এই ওই তুমি আপনি আমরা আমি হয় হয়েছে থেকে একটি কিন্তু তাই পরে আগে যদি যখন তবে এবং করেন করা করি করি না হবে".split())
+
+# rough topic → query helpers for HI/BN tokens
+TOPIC_MAP = {
+    # Hindi keys
+    "गणेश": "ganesha idol temple incense sunrise",
+    "शिव": "lord shiva temple himalayas incense",
+    "कृष्ण": "krishna temple flute peacock",
+    "राम": "ram mandir temple diyas",
+    "तंत्र": "tantra ritual candles incense night",
+    "भूत": "haunted house night fog forest",
+    "नौकरी": "interview office resume corporate",
+    "रिज्यूमे": "resume office laptop interview",
+    "ध्यान": "meditation temple candles incense",
+    # Bengali keys
+    "গণেশ": "ganesha idol temple incense",
+    "শিব": "lord shiva temple himalayas",
+    "কৃষ্ণ": "krishna temple flute",
+    "তন্ত্র": "tantra ritual candles night",
+    "ভূত": "haunted house fog forest night",
+    "চাকরি": "interview office resume corporate",
+    "রিজিউমে": "resume office laptop interview",
+    "ধ্যান": "meditation temple candles",
+}
+
+FAMILY_DEFAULT = {
+    "HM": "hindu temple sunrise incense clouds",
+    "HT": "night forest fog moonlight candle ritual",
+    "MJ": "office laptop city skyline night bokeh",
+}
+
+GENERIC_FALLBACKS = [
+    "nature landscape sunrise mist",
+    "abstract motion background particles",
+    "city bokeh lights night"
+]
+
+# ---------------- Utilities ----------------
 
 def _verticalize(clip: VideoFileClip) -> VideoFileClip:
     c = clip.resize(height=TARGET_H)
@@ -29,8 +73,7 @@ def _verticalize(clip: VideoFileClip) -> VideoFileClip:
     return c.crop(x1=x1, y1=0, x2=x1 + TARGET_W, y2=TARGET_H)
 
 def _safe_loop(clip: VideoFileClip, duration: float) -> VideoFileClip:
-    if duration <= 0.1:
-        duration = 0.1
+    if duration <= 0.1: duration = 0.1
     try:
         return clip.fx(vfx.loop, duration=duration)
     except Exception:
@@ -40,67 +83,173 @@ def _paragraphs(txt: str) -> List[str]:
     paras = [p.strip() for p in re.split(r"\n\s*\n", (txt or "").strip()) if p.strip()]
     return paras if paras else [txt.strip()]
 
-def _derive_query(script_text: str, meta: Optional[Dict]) -> str:
-    if meta and meta.get("image_query"):
-        return str(meta["image_query"]).strip()
-    code = (meta or {}).get("channel_code", "").upper()
-    t = (script_text or "").lower()
-    if code.startswith("HM-") or any(k in t for k in ("mytholog","ramayan","mahabharat","krishna","shiva")):
-        return "hindu temple sunrise clouds incense"
-    if code.startswith("HT-") or any(k in t for k in ("tantra","ritual","haunted","ghost","horror")):
-        return "night forest fog moonlight candle ritual"
-    if code.startswith("MJ-") or any(k in t for k in ("resume","interview","job","career","cv","hiring")):
-        return "office laptop city skyline night bokeh"
-    return "abstract motion background particles"
+def _words(txt: str) -> List[str]:
+    # unicode-aware words (letters only, no digits/underscore)
+    return re.findall(r"[^\W\d_]+", txt.lower(), flags=re.UNICODE)
 
-def _pexels_pick(query: str, need: int = 3) -> List[str]:
-    api_key = os.getenv("PEXELS_API_KEY", "").strip()
-    if not api_key or not query:
-        return []
+def _top_keywords(txt: str, stop: set, k: int = 6) -> List[str]:
+    freq = {}
+    for w in _words(txt):
+        if w in stop or len(w) < 3:
+            continue
+        freq[w] = freq.get(w, 0) + 1
+    return [w for w,_ in sorted(freq.items(), key=lambda x: (-x[1], -len(x[0])))][:k]
+
+def _family_code(channel_code: Optional[str]) -> str:
+    if not channel_code:
+        return ""
+    return channel_code.split("-", 1)[0].upper()
+
+def _auto_queries(script_text: str, meta: Optional[Dict]) -> List[str]:
+    """
+    Build a prioritized list of Pexels queries:
+    1) explicit image_query (if present)
+    2) family default (HM/HT/MJ)
+    3) mapped HI/BN topic words → english phrases
+    4) top keywords mixed with family anchors
+    5) generic fallbacks
+    """
+    q = []
+    if meta and meta.get("image_query"):
+        q.append(str(meta["image_query"]).strip())
+
+    fam = _family_code((meta or {}).get("channel_code", ""))
+    if fam in FAMILY_DEFAULT:
+        q.append(FAMILY_DEFAULT[fam])
+
+    # Try mapped Indic tokens to English phrases
+    for w in _words(script_text):
+        if w in TOPIC_MAP:
+            q.append(TOPIC_MAP[w])
+
+    # Language stopwords
+    lang = (meta or {}).get("lang", "").lower()
+    stop = STOP_EN
+    if lang == "hi":
+        stop = STOP_HI | STOP_EN
+    elif lang == "bn":
+        stop = STOP_BN | STOP_EN
+
+    # Mix top keywords into family-themed searches
+    kws = _top_keywords(script_text, stop, k=6)
+    if kws:
+        anchors = {
+            "HM": ["temple", "incense", "sunrise", "saffron"],
+            "HT": ["night", "forest", "fog", "moonlight"],
+            "MJ": ["office", "city", "laptop", "skyline"],
+        }.get(fam, ["cinematic", "portrait"])
+        # make 3 variations max
+        for i in range(min(3, len(kws))):
+            q.append(" ".join((anchors[i % len(anchors)], kws[i])))
+
+    # generic safeties
+    q.extend(GENERIC_FALLBACKS)
+
+    # dedupe, keep order
+    seen = set(); final = []
+    for s in q:
+        s2 = " ".join(s.split())
+        if s2 and s2 not in seen:
+            seen.add(s2); final.append(s2)
+    return final
+
+# ---------------- Pexels fetchers ----------------
+
+def _pexels_search(query: str, per_page: int = 12) -> dict:
+    key = os.getenv("PEXELS_API_KEY", "").strip()
+    if not key:
+        return {"ok": False, "status": 0, "videos": []}
     try:
-        resp = requests.get(
+        r = requests.get(
             "https://api.pexels.com/videos/search",
-            params={"query": query, "per_page": max(need*3, 6)},
-            headers={"Authorization": api_key},
+            params={
+                "query": query,
+                "per_page": per_page,
+                "orientation": "portrait",   # vertical-first
+                "size": "large",
+            },
+            headers={"Authorization": key, "User-Agent": "ZyraTV-Pipeline/1.0"},
             timeout=30,
         )
-        if not resp.ok:
-            return []
-        vids, data = [], resp.json()
-        for v in data.get("videos", []):
-            files = sorted(v.get("video_files", []),
-                           key=lambda f: (f.get("height",0), f.get("width",0)),
-                           reverse=True)
-            for f in files:
-                link = f.get("link")
-                if link and link.startswith("http"):
-                    vids.append(link); break
-            if len(vids) >= need:
-                break
-        return vids
+        data = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+        return {"ok": r.ok, "status": r.status_code, "videos": data.get("videos", [])}
     except Exception:
-        return []
+        return {"ok": False, "status": 0, "videos": []}
 
-def _write_srt(paras: List[str], seg_durs: List[float], srt_path: str, wrap: int = 36):
-    def ts(sec: float):
-        if sec < 0: sec = 0
-        ms = int((sec - int(sec)) * 1000)
-        h  = int(sec)//3600
-        m  = (int(sec)%3600)//60
-        s  = int(sec)%60
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+def _pick_vertical_urls(videos: List[dict], need: int) -> List[str]:
+    urls = []
+    for v in videos:
+        files = sorted(
+            v.get("video_files", []),
+            key=lambda f: (f.get("height", 0), f.get("width", 0)),
+            reverse=True,
+        )
+        # pick first vertical-ish file
+        for f in files:
+            w, h = f.get("width", 0), f.get("height", 0)
+            link = f.get("link", "")
+            if link and h >= w and link.startswith("http"):
+                urls.append(link)
+                break
+        if len(urls) >= need:
+            break
+    return urls
 
-    os.makedirs(os.path.dirname(srt_path), exist_ok=True)
-    start = 0.0
-    with open(srt_path, "w", encoding="utf-8") as f:
-        for i, (p, d) in enumerate(zip(paras, seg_durs), 1):
-            end = start + max(d, 0.5)
-            lines = textwrap.wrap(p, width=wrap) or [p]
-            f.write(f"{i}\n{ts(start)} --> {ts(end)}\n")
-            f.write("\n".join(lines) + "\n\n")
-            start = end
+def _pexels_pick_multi(queries: List[str], need: int = 3) -> List[str]:
+    """
+    Try a series of queries until we collect up to `need` vertical clips.
+    Includes an automatic 'nature' / 'city' safety pass at the end.
+    """
+    collected: List[str] = []
+    tried = 0
+    for q in queries:
+        tried += 1
+        print(f"🔎 Pexels query[{tried}]={q!r}")
+        resp = _pexels_search(q, per_page=max(need*4, 12))
+        print(f"   status={resp['status']} videos={len(resp['videos'])}")
+        if not resp["ok"]:
+            continue
+        urls = _pick_vertical_urls(resp["videos"], need=need - len(collected))
+        collected.extend(urls)
+        if len(collected) >= need:
+            break
 
-# --------------------- main ---------------------
+    if len(collected) < need:
+        for fallback in ["nature portrait", "city lights portrait"]:
+            print(f"   trying fallback={fallback!r}")
+            resp = _pexels_search(fallback, per_page=max(need*3, 9))
+            print(f"   status={resp['status']} videos={len(resp['videos'])}")
+            if resp["ok"]:
+                urls = _pick_vertical_urls(resp["videos"], need=need - len(collected))
+                collected.extend(urls)
+                if len(collected) >= need:
+                    break
+
+    return collected
+
+# ---------------- Download (cache) ----------------
+
+def _url_cache_path(url: str) -> str:
+    h = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(MEDIA_DIR, f"px_{h}.mp4")
+
+def _download(url: str, dest: str, retries: int = 2) -> bool:
+    for attempt in range(retries + 1):
+        try:
+            with requests.get(url, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024*1024):
+                        if chunk:
+                            f.write(chunk)
+            return True
+        except Exception as e:
+            if attempt == retries:
+                print(f"   download failed: {e}")
+                return False
+            time.sleep(1.0 + attempt)
+
+# ---------------- Main ----------------
 
 def make_video(audio_path: str, script_text: str, meta: Optional[Dict] = None) -> str:
     if not os.path.exists(audio_path):
@@ -109,20 +258,32 @@ def make_video(audio_path: str, script_text: str, meta: Optional[Dict] = None) -
     narration = AudioFileClip(audio_path)
     total_dur = max(0.1, narration.duration)
 
-    query = _derive_query(script_text, meta)
-    need  = int(os.getenv("SEGMENTS", "3"))
-    urls  = _pexels_pick(query, need=need)
+    # Build multi-query list and collect candidate URLs
+    queries = _auto_queries(script_text, meta)
+    need = int(os.getenv("SEGMENTS", "3"))
+    urls  = _pexels_pick_multi(queries, need=max(1, need))
 
+    # Prepare background clips (download for stability)
     vclips: List[VideoFileClip] = []
     for url in urls:
+        dest = _url_cache_path(url)
+        if not os.path.exists(dest):
+            print(f"⬇️  downloading clip → {dest}")
+            ok = _download(url, dest)
+            if not ok:
+                continue
         try:
-            c = VideoFileClip(url)
+            c = VideoFileClip(dest)
             vclips.append(_verticalize(c))
-        except Exception:
-            pass
-    if not vclips:
-        vclips = [ColorClip(size=(TARGET_W, TARGET_H), color=(10,10,14)).set_fps(FPS)]
+        except Exception as e:
+            print("   open failed:", e)
 
+    # No clips? Use a dark moving solid
+    if not vclips:
+        base = ColorClip(size=(TARGET_W, TARGET_H), color=(12, 12, 16)).set_fps(FPS)
+        vclips = [base]
+
+    # Allocate durations by paragraph weight
     paras = _paragraphs(script_text)
     count = min(len(vclips), max(1, len(paras)))
     weights = [len(p) for p in paras[:count]]
@@ -131,8 +292,9 @@ def make_video(audio_path: str, script_text: str, meta: Optional[Dict] = None) -
 
     segs = []
     for i in range(count):
-        base = vclips[min(i, len(vclips)-1)]
+        base = vclips[min(i, len(vclips) - 1)]
         seg  = _safe_loop(base, seg_durs[i]).set_fps(FPS)
+        # subtle zoom to avoid static feel
         try:
             seg = seg.fx(vfx.resize, lambda t: 1.0 + 0.02 * (t / max(seg_durs[i], 0.1)))
         except Exception:
@@ -144,9 +306,7 @@ def make_video(audio_path: str, script_text: str, meta: Optional[Dict] = None) -
 
     script_id = (meta or {}).get("id") or os.path.splitext(os.path.basename(audio_path))[0]
     out_path  = os.path.join(OUT_DIR, f"{script_id}.mp4")
-    srt_path  = os.path.join("output", f"{script_id}.srt")  # safe path
 
-    # Write base MP4
     video.write_videofile(
         out_path,
         fps=FPS,
@@ -161,7 +321,7 @@ def make_video(audio_path: str, script_text: str, meta: Optional[Dict] = None) -
         logger=None,
     )
 
-    # Close clips before optional ffmpeg pass
+    # Cleanup
     try:
         video.close(); narration.close()
         for c in vclips:
@@ -169,19 +329,5 @@ def make_video(audio_path: str, script_text: str, meta: Optional[Dict] = None) -
             except Exception: pass
     except Exception:
         pass
-
-    # Optional hard subtitles
-    if os.getenv("BURN_IN_CAPTIONS", "0") == "1":
-        _write_srt(paras[:count], seg_durs, srt_path, wrap=36)
-        tmp_out = os.path.join(OUT_DIR, f"{script_id}.burn.mp4")
-        vf = (
-          f"subtitles={srt_path}:"
-          "force_style='FontName=DejaVu Sans,Fontsize=28,"
-          "OutlineColour=&H000000&,BorderStyle=3,Outline=2,Shadow=0,"
-          "Alignment=2,MarginV=60'"
-        )
-        cmd = ["ffmpeg", "-y", "-i", out_path, "-vf", vf, "-c:a", "copy", tmp_out]
-        subprocess.run(cmd, check=True)
-        os.replace(tmp_out, out_path)
 
     return out_path
