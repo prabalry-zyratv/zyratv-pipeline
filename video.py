@@ -1,201 +1,194 @@
+# video.py — Serverless-friendly renderer for ZyraTV
+# - Works on Ubuntu GitHub Actions (no Windows paths, no ImageMagick)
+# - Handles long scripts by using 1–3 background clips (paragraph-weighted)
+# - Uses PEXELS_API_KEY from env; falls back to a solid color if API/rate-limit fails
+# - Respects meta from main.py (id, channel_code, image_query, etc.)
+
 import os
-import random
-import requests
 import re
-from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_videoclips, TextClip, CompositeVideoClip
-from moviepy.config import change_settings
-from pydub import AudioSegment
-import time
+import requests
+from typing import List, Optional, Dict
+from moviepy.editor import (
+    VideoFileClip, AudioFileClip, concatenate_videoclips,
+    CompositeVideoClip, vfx, ColorClip
+)
 
-# --- IMPORTANT: Set your binary paths here ---
-change_settings({"FFMPEG_BINARY": "C:\\ProgramData\\chocolatey\\lib\\ffmpeg\\tools\\ffmpeg\\bin\\ffmpeg.exe"})
-change_settings({"IMAGEMAGICK_BINARY": "C:\\Program Files\\ImageMagick-7.1.2-Q16-HDRI\\magick.exe"})
-
-# ----------------- CONFIG -----------------
-# PEXELS API KEY SHOULD NOT BE HARDCODED. USE AN ENVIRONMENT VARIABLE FOR SECURITY.
-PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY") 
-MEDIA_DIR = "input/media_temp/"
-FINAL_DIR = "output/final/"
-
+# Folders (outputs are later uploaded to Google Drive by the GitHub Action)
+MEDIA_DIR = "input/media_temp"
+OUT_DIR   = "output/final"
 os.makedirs(MEDIA_DIR, exist_ok=True)
-os.makedirs(FINAL_DIR, exist_ok=True)
+os.makedirs(OUT_DIR,   exist_ok=True)
 
-STOPWORDS = {"the","and","with","your","that","this","then","have","will","just","like","very","from","into","you"}
-FALLBACK_KEYWORDS = ["nature", "city", "people", "lifestyle"] # Very general fallbacks
+# Render settings
+TARGET_W, TARGET_H, FPS = 1080, 1920, 30
+BITRATE = "8000k"   # 8–10 Mbps is fine for 1080x1920
 
-# ----------------- HELPERS -----------------
-def extract_keywords(text):
-    """
-    Extracts a single, high-relevance keyword from text.
-    """
-    text = re.sub(r"[^a-zA-Z ]", "", text).lower()
-    words = text.split()
-    
-    # Filter out stopwords and short words, then pick the longest one
-    keywords = [w for w in words if len(w) > 3 and w not in STOPWORDS]
-    if not keywords:
-        return random.choice(FALLBACK_KEYWORDS)
+# ------------------------ Helpers ------------------------
 
-    return sorted(keywords, key=len, reverse=True)[0]
+def _verticalize(clip: VideoFileClip) -> VideoFileClip:
+    """Scale & center-crop to 1080x1920 (9:16)."""
+    c = clip.resize(height=TARGET_H)
+    if c.w < TARGET_W:
+        c = clip.resize(width=TARGET_W)
+    x1 = max(0, (c.w - TARGET_W) / 2)
+    return c.crop(x1=x1, y1=0, x2=x1 + TARGET_W, y2=TARGET_H)
 
-def fetch_pexels_video(query):
-    """Fetch a single best video for a given query with debugging."""
-    print(f"Pexels API Key being used: {PEXELS_API_KEY}")
-    headers = {"Authorization": PEXELS_API_KEY}
-    url = f"https://api.pexels.com/videos/search?query={query}&per_page=1"
-    print(f"🔍 Searching Pexels for: '{query}'")
-    
+def _safe_loop(clip: VideoFileClip, duration: float) -> VideoFileClip:
+    """Loop/trim a clip safely to exact duration."""
+    if duration <= 0.1:
+        duration = 0.1
     try:
-        response = requests.get(url, headers=headers, timeout=10) # Added a timeout
-        print(f"API Response Status Code: {response.status_code}")
-        response.raise_for_status() # This will raise an HTTPError for bad responses (4xx or 5xx)
-        data = response.json()
+        return clip.fx(vfx.loop, duration=duration)
+    except Exception:
+        return clip.set_duration(duration)
 
-        if data.get("videos"):
-            video = data["videos"][0]
-            files_sorted = sorted(video["video_files"], key=lambda x: x["width"], reverse=True)
-            video_url = files_sorted[0]["link"]
+def _paragraphs(script_text: str) -> List[str]:
+    """Split by blank lines; fallback to whole text."""
+    paras = [p.strip() for p in re.split(r"\n\s*\n", (script_text or "").strip()) if p.strip()]
+    return paras if paras else [script_text.strip()]
 
-            file_path = os.path.join(MEDIA_DIR, f"{query.replace(' ', '_')}_{int(time.time())}.mp4")
-            r = requests.get(video_url, stream=True, timeout=10)
-            r.raise_for_status()
-            with open(file_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024*1024):
-                    if chunk:
-                        f.write(chunk)
-            print(f"✅ Downloaded video for '{query}'")
-            return file_path
-        else:
-            print(f"⚠️ No results for '{query}' from API. Trying with a generic fallback...")
-            fallback_query = random.choice(FALLBACK_KEYWORDS)
-            print(f"🔍 Searching Pexels for: '{fallback_query}'")
-            url = f"https://api.pexels.com/videos/search?query={fallback_query}&per_page=1"
-            response = requests.get(url, headers=headers, timeout=10)
-            print(f"Fallback API Response Status Code: {response.status_code}")
-            data = response.json()
-            if data.get("videos"):
-                 video = data["videos"][0]
-                 files_sorted = sorted(video["video_files"], key=lambda x: x["width"], reverse=True)
-                 video_url = files_sorted[0]["link"]
-                 file_path = os.path.join(MEDIA_DIR, f"{fallback_query}_{int(time.time())}.mp4")
-                 r = requests.get(video_url, stream=True, timeout=10)
-                 r.raise_for_status()
-                 with open(file_path, "wb") as f:
-                     for chunk in r.iter_content(chunk_size=1024*1024):
-                         if chunk:
-                             f.write(chunk)
-                 print(f"✅ Downloaded video for '{fallback_query}'")
-                 return file_path
-            else:
-                 print(f"⚠️ No results for '{fallback_query}'.")
-                 return None
+def _derive_query(script_text: str, meta: Optional[Dict]) -> str:
+    """Choose a background search query (prefers explicit front-matter)."""
+    if meta and meta.get("image_query"):
+        return str(meta["image_query"]).strip()
 
-    except requests.exceptions.RequestException as e:
-        print(f"⚠️ Failed to make Pexels API request: {e}")
-        return None
+    code = (meta or {}).get("channel_code", "").upper()
+    text = (script_text or "").lower()
 
-def split_script(script_text):
-    """Split script into meaningful chunks (sentences) and return them."""
-    sentences = re.split(r'[.!?]', script_text)
-    return [s.strip() for s in sentences if s.strip()]
+    # Families you asked for
+    if code.startswith("HM-") or any(k in text for k in ("mytholog", "ramayan", "mahabharat", "krishna", "shiva")):
+        return "hindu temple sunrise clouds incense"
+    if code.startswith("HT-") or any(k in text for k in ("tantra", "ritual", "haunted", "ghost", "horror")):
+        return "night forest fog moonlight candle ritual"
+    if code.startswith("MJ-") or any(k in text for k in ("resume", "interview", "job", "career", "cv", "hiring")):
+        return "office laptop city skyline night bokeh"
 
-def get_audio_durations(audio_path, script_chunks):
+    # Generic safe fallback
+    return "abstract motion background particles"
+
+def _pexels_pick(query: str, need: int = 3) -> List[str]:
     """
-    Calculates the duration of each script chunk based on the audio.
+    Return up to `need` direct video URLs from Pexels (highest quality per result).
+    We do not download; FFmpeg can read HTTP URLs directly.
     """
-    full_audio = AudioSegment.from_mp3(audio_path)
-    total_duration_ms = len(full_audio)
-    
-    total_chars = sum(len(chunk) for chunk in script_chunks)
-    if total_chars == 0:
+    api_key = os.getenv("PEXELS_API_KEY", "").strip()
+    if not api_key or not query:
         return []
-    
-    durations = []
-    for chunk in script_chunks:
-        duration_ms = (len(chunk) / total_chars) * total_duration_ms
-        durations.append(duration_ms / 1000) # convert to seconds
-    return durations
 
-# ----------------- MAIN FUNCTION -----------------
-def make_video(audio_path, script_text):
-    """
-    Create a 9:16 reel where each sentence of script 
-    is matched with its own relevant Pexels video and includes subtitles.
-    """
-    audio_clip = AudioFileClip(audio_path)
-    audio_duration = audio_clip.duration
+    try:
+        url = "https://api.pexels.com/videos/search"
+        resp = requests.get(
+            url,
+            params={"query": query, "per_page": max(need * 3, 6)},
+            headers={"Authorization": api_key},
+            timeout=30,
+        )
+        if not resp.ok:
+            return []
+        data = resp.json()
+        vids = []
+        for v in data.get("videos", []):
+            files = sorted(
+                v.get("video_files", []),
+                key=lambda f: (f.get("height", 0), f.get("width", 0)),
+                reverse=True,
+            )
+            for f in files:
+                link = f.get("link")
+                if link and link.startswith("http"):
+                    vids.append(link)
+                    break
+            if len(vids) >= need:
+                break
+        return vids
+    except Exception:
+        return []
 
-    # Step 1: split script and get durations
-    chunks = split_script(script_text)
-    chunk_durations = get_audio_durations(audio_path, chunks)
-    
-    clips = []
-    current_time = 0
-    
-    # Step 2: fetch relevant video per chunk and add subtitles
-    for i, chunk in enumerate(chunks):
-        query = extract_keywords(chunk)
-        media_file = fetch_pexels_video(query)
-        
-        if not media_file:
-            print(f"⚠️ Skipping chunk '{chunk}' due to no video file.")
-            continue
-            
-        duration = chunk_durations[i]
-        
-        # Load clip and crop to 9:16
+# ------------------------ Main ------------------------
+
+def make_video(audio_path: str, script_text: str, meta: Optional[Dict] = None) -> str:
+    """
+    Build a vertical 1080x1920 MP4 for the given audio+script.
+    Strategy:
+      - 1–3 segments max, durations proportional to paragraph lengths
+      - Minimal Pexels lookups (serverless-friendly)
+      - Solid color fallback if nothing fetched / rate-limited
+    """
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Audio not found: {audio_path}")
+
+    # Load narration
+    narration = AudioFileClip(audio_path)
+    total_dur = max(0.1, narration.duration)
+
+    # Decide visual query & fetch a few candidates
+    query = _derive_query(script_text, meta)
+    need = int(os.getenv("SEGMENTS", "3"))  # default 3 background segments
+    urls = _pexels_pick(query, need=need)
+
+    # Turn URLs into verticalized clips (or fallback)
+    vclips: List[VideoFileClip] = []
+    for url in urls:
         try:
-            clip = VideoFileClip(media_file)
-        except Exception as e:
-            print(f"⚠️ Could not load video file {media_file}: {e}")
-            continue
+            c = VideoFileClip(url)
+            vclips.append(_verticalize(c))
+        except Exception:
+            # network/file issues — skip and try next
+            pass
 
-        # Ensure video is at least as long as the segment
-        if clip.duration < duration:
-            print(f"⚠️ Video is too short. Looping video to fit duration.")
-            clip = concatenate_videoclips([clip] * int(duration / clip.duration + 1))
-            
-        clip = clip.resize(height=1920)
-        clip = clip.crop(width=1080, height=1920,
-                         x_center=clip.w//2, y_center=clip.h//2)
-        clip = clip.subclip(0, duration)
-        
-        # Add a subtitle to the video clip
-        txt_clip = TextClip(chunk, fontsize=70, color='white', 
-                            bg_color='black', stroke_color='black', stroke_width=2,
-                            size=(1000, None), method='caption')
-        txt_clip = txt_clip.set_position(('center', 'bottom')).set_duration(duration)
-        
-        final_chunk_clip = CompositeVideoClip([clip, txt_clip])
-        final_chunk_clip.set_start(current_time)
-        
-        clips.append(final_chunk_clip)
-        current_time += duration
+    if not vclips:
+        # Fallback background if API fails or rate-limited
+        bg = ColorClip(size=(TARGET_W, TARGET_H), color=(10, 10, 14)).set_fps(FPS)
+        vclips = [bg]
 
-    if not clips:
-        raise Exception("No video clips found for any script chunk")
+    # Allocate durations by paragraph weights (paragraph count may exceed clips)
+    paras = _paragraphs(script_text)
+    count = min(len(vclips), max(1, len(paras)))
+    weights = [len(p) for p in paras[:count]]
+    wsum = sum(weights) or 1.0
+    seg_durs = [total_dur * (w / wsum) for w in weights]
 
-    # Step 3: concatenate & add audio
-    final_clip = concatenate_videoclips(clips).set_audio(audio_clip)
+    segs = []
+    for i in range(count):
+        base = vclips[min(i, len(vclips) - 1)]
+        seg = _safe_loop(base, seg_durs[i]).set_fps(FPS)
+        # subtle zoom to avoid static feel
+        try:
+            seg = seg.fx(vfx.resize, lambda t: 1.0 + 0.02 * (t / max(seg_durs[i], 0.1)))
+        except Exception:
+            pass
+        segs.append(seg)
 
-    # Step 4: export
-    base_name = os.path.splitext(os.path.basename(audio_path))[0]
-    output_path = os.path.join(FINAL_DIR, f"{base_name}.mp4")
-    
-    print("⏳ Rendering final video...")
-    final_clip.write_videofile(
-        output_path,
-        fps=24,
-        codec='libx264',
-        audio_codec='aac'
+    video = concatenate_videoclips(segs, method="compose") if len(segs) > 1 else segs[0]
+    video = video.set_audio(narration)
+
+    # Output path (use meta.id if present)
+    script_id = (meta or {}).get("id") or os.path.splitext(os.path.basename(audio_path))[0]
+    out_path = os.path.join(OUT_DIR, f"{script_id}.mp4")
+
+    # Render
+    video.write_videofile(
+        out_path,
+        fps=FPS,
+        codec="libx264",
+        audio_codec="aac",
+        bitrate=BITRATE,
+        preset="medium",
+        threads=4,
+        temp_audiofile=os.path.join("output", "temp_audio.m4a"),
+        remove_temp=True,
+        verbose=True,
+        logger=None,
     )
 
     # Cleanup
-    final_clip.close()
-    audio_clip.close()
-    for c in clips:
-        c.close()
-    for file in os.listdir(MEDIA_DIR):
-        os.remove(os.path.join(MEDIA_DIR, file))
+    try:
+        video.close()
+        narration.close()
+        for c in vclips:
+            try: c.close()
+            except Exception: pass
+    except Exception:
+        pass
 
-    return output_path
+    return out_path
