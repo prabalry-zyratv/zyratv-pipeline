@@ -65,7 +65,7 @@ def run_pipeline(limit: int = 0):
             continue
         print(f"\n🎬 [{idx}/{len(files)}] {script_id} | {meta.get('channel_code','?')} | lang={lang}")
         audio_path = os.path.join(AUDIO_DIR, f"{script_id}.mp3")
-        text_to_speech(body, audio_path)
+        text_to_speech(body, audio_path, lang=meta.get("lang"), channel_code=meta.get("channel_code"))
         try:
             final_video = make_video(audio_path, body, meta)
             print(f"✅ Done: {final_video}")
