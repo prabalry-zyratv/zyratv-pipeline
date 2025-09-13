@@ -3,10 +3,10 @@
 # - Tries multiple queries (broad → specific), vertical-first, size=large
 # - Downloads the chosen clips (stable on CI) with small retry/cache
 # - Falls back to a dark moving solid if zero results
-# - Optional caption burn-in stays handled by your workflow (unchanged)
+# - Uses CRF + x264 preset (env-tunable) and prints progress before encode
 
 import os, re, time, hashlib, requests, io
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict
 from moviepy.editor import (
     VideoFileClip, AudioFileClip, concatenate_videoclips,
     CompositeVideoClip, vfx, ColorClip
@@ -18,7 +18,11 @@ os.makedirs(MEDIA_DIR, exist_ok=True)
 os.makedirs(OUT_DIR,   exist_ok=True)
 
 TARGET_W, TARGET_H, FPS = 1080, 1920, 30
-BITRATE = "8000k"
+BITRATE = "8000k"  # kept for reference; not used when CRF is active
+
+# --- speed/quality knobs (overridable via env) ---
+ENC_PRESET = os.getenv("X264_PRESET", "veryfast")   # ultrafast…placebo
+ENC_CRF    = os.getenv("X264_CRF", "23")            # lower = higher quality
 
 # ---------------- Keywords & maps ----------------
 
@@ -138,7 +142,6 @@ def _auto_queries(script_text: str, meta: Optional[Dict]) -> List[str]:
             "HT": ["night", "forest", "fog", "moonlight"],
             "MJ": ["office", "city", "laptop", "skyline"],
         }.get(fam, ["cinematic", "portrait"])
-        # make 3 variations max
         for i in range(min(3, len(kws))):
             q.append(" ".join((anchors[i % len(anchors)], kws[i])))
 
@@ -307,13 +310,17 @@ def make_video(audio_path: str, script_text: str, meta: Optional[Dict] = None) -
     script_id = (meta or {}).get("id") or os.path.splitext(os.path.basename(audio_path))[0]
     out_path  = os.path.join(OUT_DIR, f"{script_id}.mp4")
 
+    # --- progress + tuned encode ---
+    print(f"🎛️  segments={len(segs)} total_dur={total_dur:.1f}s seg_durs={[round(d,1) for d in seg_durs]}")
+    print("⏳ Encoding to MP4… (libx264)")
+
     video.write_videofile(
         out_path,
-        fps=FPS,
+        fps=24,  # a bit lighter than 30
         codec="libx264",
         audio_codec="aac",
-        bitrate=BITRATE,
-        preset="medium",
+        preset=ENC_PRESET,
+        ffmpeg_params=["-crf", ENC_CRF, "-movflags", "+faststart", "-v", "verbose"],
         threads=4,
         temp_audiofile=os.path.join("output", "temp_audio.m4a"),
         remove_temp=True,
