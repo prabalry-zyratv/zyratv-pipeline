@@ -159,36 +159,44 @@ jobs:
           python -c "import sys,os; print('Python OK:', sys.version)"
           python main.py
 
-      - name: Upload to Google Drive (Output folder)
+            - name: Upload to Google Drive (Output folder)
+        continue-on-error: true  # don't block artifacts if Drive upload fails
         env:
           GDRIVE_JSON: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS }}
           FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
         run: |
           python - << 'PY'
-          import os, json, glob, sys
+          import os, json, glob
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
           from googleapiclient.http import MediaFileUpload
 
-          creds_info = json.loads(os.environ['GDRIVE_JSON'])
-          folder_id  = os.environ['FOLDER_ID'].strip()
           creds = service_account.Credentials.from_service_account_info(
-              creds_info, scopes=['https://www.googleapis.com/auth/drive']
+              json.loads(os.environ['GDRIVE_JSON']),
+              scopes=['https://www.googleapis.com/auth/drive']
           )
           drive = build('drive', 'v3', credentials=creds)
 
           files = glob.glob('output/final/*.mp4')
           if not files:
               print("No MP4s found in output/final — nothing to upload.")
-              sys.exit(0)
+              raise SystemExit(0)
+
+          folder_id = os.environ['FOLDER_ID'].strip()
 
           for path in files:
               name = os.path.basename(path)
               meta  = {'name': name, 'parents': [folder_id]}
               media = MediaFileUpload(path, mimetype='video/mp4', resumable=False)
-              created = drive.files().create(body=meta, media_body=media, fields='id,name').execute()
+              created = drive.files().create(
+                  body=meta,
+                  media_body=media,
+                  fields='id,name',
+                  supportsAllDrives=True          # ← required for Shared drives
+              ).execute()
               print(f"Uploaded {name} -> fileId {created.get('id')}")
           PY
+
 
       - name: Keep a copy as workflow artifact (optional)
         uses: actions/upload-artifact@v4
