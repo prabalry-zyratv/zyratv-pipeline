@@ -14,23 +14,19 @@ jobs:
   render:
     runs-on: ubuntu-latest
     env:
-      # Rendering controls
-      SEGMENTS: "3"                  # visuals per video (2–3 good for 6–9 min)
-      VIDEOS_LIMIT: ""               # set to "1" to test a single video
-      BURN_IN_CAPTIONS: "0"          # set "1" to burn captions
-
-      # Debug (optional: add these two secrets to get verbose logs)
-      # ACTIONS_RUNNER_DEBUG / ACTIONS_STEP_DEBUG as repo secrets => 'true'
-
-      # Secrets
+      SEGMENTS: "3"
+      VIDEOS_LIMIT: "1"                     # ← test one video
+      BURN_IN_CAPTIONS: "0"                 # ← captions off
       PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-      GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}                 # OUTPUT (Shared drive folder ID)
-      GOOGLE_DRIVE_CREDENTIALS: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS }}             # SA JSON
-      GOOGLE_DRIVE_INPUT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_INPUT_FOLDER_ID }}     # INPUT parent folder ID
 
-      # Make Python logs unbuffered
+      GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+      GOOGLE_DRIVE_INPUT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_INPUT_FOLDER_ID }}
+      GOOGLE_DRIVE_CREDENTIALS: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS }}
+
       PYTHONUNBUFFERED: "1"
       PYTHONFAULTHANDLER: "1"
+      IMAGEIO_FFMPEG_EXE: /usr/bin/ffmpeg
+
 
     steps:
       - name: Checkout
