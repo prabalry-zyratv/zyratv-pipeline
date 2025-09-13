@@ -1,5 +1,8 @@
 gTTS==2.5.4
 moviepy==1.0.3
+imageio-ffmpeg==0.4.8
 pydub==0.25.1
 requests==2.32.3
 PyYAML==6.0.2
+pillow==9.5.0        # ANTIALIAS still present; avoids the error
+numpy<2              # MoviePy 1.x is happier with NumPy 1.x
