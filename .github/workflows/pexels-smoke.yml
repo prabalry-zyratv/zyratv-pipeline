@@ -1,0 +1,40 @@
+name: Pexels Smoke Test
+on:
+  workflow_dispatch: {}
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    env:
+      PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests (tiny)
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Check Pexels key & fetch 1 video
+        run: |
+          python - << 'PY'
+          import os, requests, sys
+          k = os.environ.get('PEXELS_API_KEY','').strip()
+          if not k:
+              print("❌ Missing PEXELS_API_KEY secret"); sys.exit(1)
+          hdr = {'Authorization': k, 'User-Agent': 'ZyraTV-Pipeline/1.0'}
+          r = requests.get(
+              'https://api.pexels.com/videos/search',
+              params={'query':'nature','per_page':1,'orientation':'portrait','size':'large'},
+              headers=hdr, timeout=20
+          )
+          print("Pexels status:", r.status_code)
+          try:
+              print("videos:", len(r.json().get('videos',[])))
+          except Exception:
+              print("body (truncated):", r.text[:300])
+          sys.exit(0 if r.ok else 1)
+          PY
