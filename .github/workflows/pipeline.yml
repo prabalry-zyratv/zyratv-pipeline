@@ -155,6 +155,20 @@ jobs:
           python -c "import sys,os; print('Python OK:', sys.version)"
           python main.py
 
+       # after the "Render videos" step:
+          
+      - name: Show media cache
+        if: always()
+        run: |
+          echo "---- input/media_temp ----"
+          ls -la input/media_temp || true
+
+      - name: Show outputs
+        if: always()
+        run: |
+           echo "---- output ----"
+           find output -maxdepth 3 -type f -print || true
+
       - name: Upload to Google Drive (Output folder - Shared drive)
         env:
           GDRIVE_JSON: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS }}
