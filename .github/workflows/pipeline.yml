@@ -15,12 +15,16 @@ jobs:
   render:
     runs-on: ubuntu-latest
     env:
-      SEGMENTS: "3"                      # visuals per video (2–3 is good for 6–9 min)
-      VIDEOS_LIMIT: ""                   # set to "1" to test one video
+      # Rendering controls
+      SEGMENTS: "3"                        # visuals per video (2–3 is good for 6–9 min)
+      VIDEOS_LIMIT: ""                     # set to "1" to test a single video
+      BURN_IN_CAPTIONS: "0"                # set to "1" later if you enable caption burn-in
+
+      # Secrets (already added in repo Settings → Secrets and variables → Actions)
       PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-      GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}         # OUTPUT folder (already set)
-      GOOGLE_DRIVE_CREDENTIALS: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS }}     # SA JSON (already set)
-      GOOGLE_DRIVE_INPUT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_INPUT_FOLDER_ID }} # NEW: INPUT folder
+      GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}                 # OUTPUT folder
+      GOOGLE_DRIVE_CREDENTIALS: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS }}             # SA JSON
+      GOOGLE_DRIVE_INPUT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_INPUT_FOLDER_ID }}     # INPUT folder
 
     steps:
       - name: Checkout
@@ -31,10 +35,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install system deps (ffmpeg)
+      - name: Install system deps (ffmpeg + fonts)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
 
       - name: Install Python deps
         run: |
@@ -49,45 +53,50 @@ jobs:
           INPUT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_INPUT_FOLDER_ID }}
         run: |
           python - << 'PY'
-          import os, io, re, json, shutil
+          import os, io, re, json, shutil, sys
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
           from googleapiclient.http import MediaIoBaseDownload
 
-          creds_info = json.loads(os.environ['GDRIVE_JSON'])
-          input_root = os.environ['INPUT_FOLDER_ID'].strip()
+          # --- sanity: show which folder we're using
+          input_root = os.environ.get('INPUT_FOLDER_ID', '').strip()
+          if not input_root:
+              print("❌ GOOGLE_DRIVE_INPUT_FOLDER_ID is empty/missing.")
+              sys.exit(1)
+          print(f"🔎 Using INPUT FOLDER ID: {input_root}")
+
+          # --- auth
+          try:
+              creds_info = json.loads(os.environ['GDRIVE_JSON'])
+          except Exception as e:
+              print("❌ Could not parse GOOGLE_DRIVE_CREDENTIALS JSON:", e)
+              sys.exit(1)
 
           creds = service_account.Credentials.from_service_account_info(
               creds_info, scopes=['https://www.googleapis.com/auth/drive']
           )
           drive = build('drive', 'v3', credentials=creds)
 
-          # Clean local input/scripts to avoid stale files
+          # clean local input/scripts to avoid stale files
           shutil.rmtree('input/scripts', ignore_errors=True)
 
           def list_children(folder_id, mime=None):
               q = f"'{folder_id}' in parents and trashed=false"
-              if mime:
-                  q += f" and mimeType='{mime}'"
-              items, pageToken = [], None
+              if mime: q += f" and mimeType='{mime}'"
+              items, token = [], None
               while True:
                   resp = drive.files().list(
-                      q=q,
-                      fields="nextPageToken, files(id,name,mimeType)",
-                      pageToken=pageToken
+                      q=q, fields="nextPageToken, files(id,name,mimeType)", pageToken=token
                   ).execute()
                   items.extend(resp.get('files', []))
-                  pageToken = resp.get('nextPageToken')
-                  if not pageToken:
-                      break
-                  # safety: limit pages (optional)
+                  token = resp.get('nextPageToken')
+                  if not token: break
               return items
 
           def download_file(file, dest_path):
               os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-              mime = file.get('mimeType')
-              fid  = file['id']
-              buf  = io.BytesIO()
+              mime = file.get('mimeType'); fid = file['id']
+              buf = io.BytesIO()
               if mime == 'application/vnd.google-apps.document':
                   req = drive.files().export_media(fileId=fid, mimeType='text/plain')
               else:
@@ -98,42 +107,51 @@ jobs:
                   status, done = downloader.next_chunk()
               with open(dest_path, 'wb') as f:
                   f.write(buf.getvalue())
-              print(f"Downloaded: {dest_path}")
+              print(f"⬇️  Downloaded: {dest_path}")
 
           # Prefer subfolders (HM-HI, HT-EN, etc.)
-          subfolders = list_children(input_root, mime="application/vnd.google-apps.folder")
-          downloaded = 0
+          subs = list_children(input_root, mime="application/vnd.google-apps.folder")
+          print("📁 Subfolders found:", [s['name'] for s in subs] or "(none)")
 
-          # If there are subfolders, use them as channel_code; else parse filename prefix
-          if subfolders:
-              for sf in subfolders:
-                  code = sf['name']  # expected HM-HI / HT-EN / MJ-BN etc.
+          downloaded = 0
+          if subs:
+              for sf in subs:
+                  code = sf['name']  # e.g., HM-HI / HT-EN / MJ-BN
                   files = list_children(sf['id'])
+                  if not files:
+                      print(f"⚠️ Empty folder on Drive: {code}")
                   for f in files:
                       mt = f['mimeType']
                       if mt in ('text/plain','text/markdown','application/vnd.google-apps.document'):
-                          base, ext = os.path.splitext(f['name'])
-                          local_path = os.path.join('input','scripts',code, base + '.txt')
-                          download_file(f, local_path)
+                          base, _ = os.path.splitext(f['name'])
+                          local = os.path.join('input','scripts',code, base + '.txt')
+                          download_file(f, local)
                           downloaded += 1
                       else:
-                          print(f"Skipping non-text: {f['name']} ({mt})")
+                          print(f"⏭️  Skipping non-text: {f['name']} ({mt})")
           else:
-              # Fallback: files directly under root; derive code from filename prefix "HM-HI-001.txt"
+              # Files directly under root; derive channel_code from filename prefix "HM-HI-001.txt"
               files = list_children(input_root)
+              print("📄 Files in root:", [f['name'] for f in files])
               for f in files:
                   mt = f['mimeType']
                   if mt in ('text/plain','text/markdown','application/vnd.google-apps.document'):
-                      base, ext = os.path.splitext(f['name'])
+                      base, _ = os.path.splitext(f['name'])
                       m = re.match(r'^([A-Z]{2}-[A-Z]{2})-', base)
                       code = m.group(1) if m else 'UNCATEGORIZED'
-                      local_path = os.path.join('input','scripts',code, base + '.txt')
-                      download_file(f, local_path)
+                      local = os.path.join('input','scripts',code, base + '.txt')
+                      download_file(f, local)
                       downloaded += 1
                   else:
-                      print(f"Skipping non-text: {f['name']} ({mt})")
+                      print(f"⏭️  Skipping non-text: {f['name']} ({mt})")
 
-          print(f"Fetched {downloaded} script file(s) from Drive.")
+          print(f"✅ Downloaded {downloaded} script file(s).")
+          if downloaded == 0:
+              print("❌ No scripts downloaded. Fix one of these and rerun:")
+              print("   • Confirm the Google Doc/Text exists in the INPUT folder.")
+              print("   • The folder and subfolders are shared with the service account (Editor).")
+              print("   • The secret GOOGLE_DRIVE_INPUT_FOLDER_ID matches the parent folder ID.")
+              sys.exit(1)
           PY
 
       - name: Render videos
