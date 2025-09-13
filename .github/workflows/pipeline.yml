@@ -4,27 +4,33 @@ on:
   workflow_dispatch: {}
   push:
     paths:
-      - "input/scripts/**"
-      - "main.py"
-      - "tts.py"
-      - "video.py"
-      - "requirements.txt"
-      - ".github/workflows/pipeline.yml"
+      - "input/scripts/**"     # optional: auto-run only when scripts change
+
+concurrency:
+  group: zyratv-pipeline-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   render:
     runs-on: ubuntu-latest
     env:
       # Rendering controls
-      SEGMENTS: "3"                        # visuals per video (2–3 is good for 6–9 min)
-      VIDEOS_LIMIT: ""                     # set to "1" to test a single video
-      BURN_IN_CAPTIONS: "0"                # set to "1" later if you enable caption burn-in
+      SEGMENTS: "3"                  # visuals per video (2–3 good for 6–9 min)
+      VIDEOS_LIMIT: ""               # set to "1" to test a single video
+      BURN_IN_CAPTIONS: "0"          # set "1" to burn captions
 
-      # Secrets (already added in repo Settings → Secrets and variables → Actions)
+      # Debug (optional: add these two secrets to get verbose logs)
+      # ACTIONS_RUNNER_DEBUG / ACTIONS_STEP_DEBUG as repo secrets => 'true'
+
+      # Secrets
       PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-      GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}                 # OUTPUT folder
+      GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}                 # OUTPUT (Shared drive folder ID)
       GOOGLE_DRIVE_CREDENTIALS: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS }}             # SA JSON
-      GOOGLE_DRIVE_INPUT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_INPUT_FOLDER_ID }}     # INPUT folder
+      GOOGLE_DRIVE_INPUT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_INPUT_FOLDER_ID }}     # INPUT parent folder ID
+
+      # Make Python logs unbuffered
+      PYTHONUNBUFFERED: "1"
+      PYTHONFAULTHANDLER: "1"
 
     steps:
       - name: Checkout
@@ -44,8 +50,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # Drive libs for fetching + uploading
           pip install google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
+
+      - name: Print env & Python info
+        run: |
+          python -V
+          echo "SEGMENTS=$SEGMENTS  VIDEOS_LIMIT=$VIDEOS_LIMIT  BURN_IN_CAPTIONS=$BURN_IN_CAPTIONS"
+          echo "Has PEXELS? " $([ -n "$PEXELS_API_KEY" ] && echo YES || echo NO)
 
       - name: Fetch scripts from Google Drive → input/scripts/**
         env:
@@ -58,26 +69,17 @@ jobs:
           from googleapiclient.discovery import build
           from googleapiclient.http import MediaIoBaseDownload
 
-          # --- sanity: show which folder we're using
-          input_root = os.environ.get('INPUT_FOLDER_ID', '').strip()
+          input_root = os.environ.get('INPUT_FOLDER_ID','').strip()
           if not input_root:
-              print("❌ GOOGLE_DRIVE_INPUT_FOLDER_ID is empty/missing.")
-              sys.exit(1)
+              print("❌ GOOGLE_DRIVE_INPUT_FOLDER_ID is empty"); sys.exit(1)
           print(f"🔎 Using INPUT FOLDER ID: {input_root}")
 
-          # --- auth
-          try:
-              creds_info = json.loads(os.environ['GDRIVE_JSON'])
-          except Exception as e:
-              print("❌ Could not parse GOOGLE_DRIVE_CREDENTIALS JSON:", e)
-              sys.exit(1)
-
+          creds_info = json.loads(os.environ['GDRIVE_JSON'])
           creds = service_account.Credentials.from_service_account_info(
               creds_info, scopes=['https://www.googleapis.com/auth/drive']
           )
-          drive = build('drive', 'v3', credentials=creds)
+          drive = build('drive','v3',credentials=creds)
 
-          # clean local input/scripts to avoid stale files
           shutil.rmtree('input/scripts', ignore_errors=True)
 
           def list_children(folder_id, mime=None):
@@ -109,14 +111,13 @@ jobs:
                   f.write(buf.getvalue())
               print(f"⬇️  Downloaded: {dest_path}")
 
-          # Prefer subfolders (HM-HI, HT-EN, etc.)
           subs = list_children(input_root, mime="application/vnd.google-apps.folder")
           print("📁 Subfolders found:", [s['name'] for s in subs] or "(none)")
 
           downloaded = 0
           if subs:
               for sf in subs:
-                  code = sf['name']  # e.g., HM-HI / HT-EN / MJ-BN
+                  code = sf['name']  # HM-HI / HT-EN / MJ-BN
                   files = list_children(sf['id'])
                   if not files:
                       print(f"⚠️ Empty folder on Drive: {code}")
@@ -130,7 +131,6 @@ jobs:
                       else:
                           print(f"⏭️  Skipping non-text: {f['name']} ({mt})")
           else:
-              # Files directly under root; derive channel_code from filename prefix "HM-HI-001.txt"
               files = list_children(input_root)
               print("📄 Files in root:", [f['name'] for f in files])
               for f in files:
@@ -147,20 +147,19 @@ jobs:
 
           print(f"✅ Downloaded {downloaded} script file(s).")
           if downloaded == 0:
-              print("❌ No scripts downloaded. Fix one of these and rerun:")
-              print("   • Confirm the Google Doc/Text exists in the INPUT folder.")
-              print("   • The folder and subfolders are shared with the service account (Editor).")
-              print("   • The secret GOOGLE_DRIVE_INPUT_FOLDER_ID matches the parent folder ID.")
-              sys.exit(1)
+              print("❌ No scripts downloaded. Check sharing & folder ID and rerun."); sys.exit(1)
           PY
+
+      - name: Show repository tree (after fetch)
+        run: |
+          find input -maxdepth 3 -type f -print || true
 
       - name: Render videos
         run: |
           python -c "import sys,os; print('Python OK:', sys.version)"
           python main.py
 
-            - name: Upload to Google Drive (Output folder)
-        continue-on-error: true  # don't block artifacts if Drive upload fails
+      - name: Upload to Google Drive (Output folder - Shared drive)
         env:
           GDRIVE_JSON: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS }}
           FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
@@ -192,15 +191,16 @@ jobs:
                   body=meta,
                   media_body=media,
                   fields='id,name',
-                  supportsAllDrives=True          # ← required for Shared drives
+                  supportsAllDrives=True     # IMPORTANT for Shared drives
               ).execute()
               print(f"Uploaded {name} -> fileId {created.get('id')}")
           PY
 
-
-      - name: Keep a copy as workflow artifact (optional)
+      - name: Keep a copy as workflow artifact (always)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mp4-outputs
           path: output/final/*.mp4
           if-no-files-found: warn
+          retention-days: 7
