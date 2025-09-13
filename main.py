@@ -4,6 +4,18 @@ from tts import text_to_speech
 from video import make_video
 import yaml
 
+# --- add helpers ---
+LANG_BY_CC = {"HI": "hi", "BN": "bn", "EN": "en"}
+
+def infer_lang_from_channel_code(channel_code: str | None) -> str | None:
+    if not channel_code:
+        return None
+    # Expect formats like HM-HI / HT-EN / MJ-BN
+    parts = channel_code.split("-", 1)
+    if len(parts) == 2:
+        return LANG_BY_CC.get(parts[1].upper())
+    return LANG_BY_CC.get(channel_code.upper())
+
 SCRIPTS_ROOT = "input/scripts"
 AUDIO_DIR = "output/audio"
 FINAL_DIR = "output/final"
@@ -23,12 +35,21 @@ def parse_script(path: str) -> Tuple[Dict, str]:
         meta = yaml.safe_load(fm_yaml) or {}
     else:
         meta, body = {}, raw
+
     fname = os.path.splitext(os.path.basename(path))[0]
     meta.setdefault("id", fname)
-    meta.setdefault("lang", "en")
+
+    # derive channel_code from parent folder
     parent = os.path.basename(os.path.dirname(path))
     if parent and parent not in (".", "scripts"):
         meta.setdefault("channel_code", parent)
+
+    # infer lang from channel_code if not provided in front-matter
+    if not meta.get("lang"):
+        inferred = infer_lang_from_channel_code(meta.get("channel_code"))
+        if inferred:
+            meta["lang"] = inferred
+
     body = body.replace("\r\n", "\n").strip()
     return meta, body
 
@@ -40,8 +61,10 @@ def safe_id(s: str) -> str:
     return s2 or hashlib.sha1(s.encode("utf-8")).hexdigest()[:8]
 
 def discover_scripts():
-    patterns = [os.path.join(SCRIPTS_ROOT, "**", "*.md"),
-                os.path.join(SCRIPTS_ROOT, "**", "*.txt")]
+    patterns = [
+        os.path.join(SCRIPTS_ROOT, "**", "*.md"),
+        os.path.join(SCRIPTS_ROOT, "**", "*.txt"),
+    ]
     files = []
     for p in patterns:
         files.extend(glob.glob(p, recursive=True))
@@ -52,29 +75,42 @@ def run_pipeline(limit: int = 0):
     if not files:
         print(f"❌ No scripts found under {SCRIPTS_ROOT}/")
         return
+
     produced = 0
     for idx, path in enumerate(files, start=1):
         meta, body = parse_script(path)
         script_id = safe_id(meta.get("id", os.path.splitext(os.path.basename(path))[0]))
-        lang = meta.get("lang", "en")
+        lang = meta.get("lang") or "en"  # for logging only
+
         if not body:
-            print(f"⚠️ Skipping empty script: {path}")
+            print(f"⚠️  Skipping empty script: {path}")
             continue
         if already_done(script_id):
             print(f"⏭️  Skipping {script_id} (final MP4 exists)")
             continue
+
         print(f"\n🎬 [{idx}/{len(files)}] {script_id} | {meta.get('channel_code','?')} | lang={lang}")
         audio_path = os.path.join(AUDIO_DIR, f"{script_id}.mp3")
-        text_to_speech(body, audio_path, lang=meta.get("lang"), channel_code=meta.get("channel_code"))
+
+        # TTS (tts.py will also normalize from channel_code if needed)
+        text_to_speech(
+            body,
+            audio_path,
+            lang=meta.get("lang"),
+            channel_code=meta.get("channel_code"),
+        )
+
         try:
             final_video = make_video(audio_path, body, meta)
             print(f"✅ Done: {final_video}")
             produced += 1
         except Exception as e:
             print(f"❌ Failed {script_id}: {e}")
+
         if limit and produced >= limit:
             print(f"\n✅ Limit reached ({limit}). Stopping.")
             break
+
     print(f"\n🎉 Finished. Produced: {produced} videos.")
 
 if __name__ == "__main__":
