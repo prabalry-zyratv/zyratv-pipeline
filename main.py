@@ -67,7 +67,7 @@ def run_pipeline(limit: int = 0):
         audio_path = os.path.join(AUDIO_DIR, f"{script_id}.mp3")
         text_to_speech(body, audio_path)
         try:
-            final_video = make_video(audio_path, body)
+            final_video = make_video(audio_path, body, meta)
             print(f"✅ Done: {final_video}")
             produced += 1
         except Exception as e:
