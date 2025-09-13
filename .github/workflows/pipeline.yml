@@ -15,14 +15,12 @@ jobs:
   render:
     runs-on: ubuntu-latest
     env:
-      # Optional: keep 2–3 segments per long video (good for 6–9 min scripts)
-      SEGMENTS: "3"
-      # Optional: limit how many videos to produce in one run (blank = no limit)
-      VIDEOS_LIMIT: ""
-      # Secrets
+      SEGMENTS: "3"                      # visuals per video (2–3 is good for 6–9 min)
+      VIDEOS_LIMIT: ""                   # set to "1" to test one video
       PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-      GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
-      GOOGLE_DRIVE_CREDENTIALS: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS }}
+      GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}         # OUTPUT folder (already set)
+      GOOGLE_DRIVE_CREDENTIALS: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS }}     # SA JSON (already set)
+      GOOGLE_DRIVE_INPUT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_INPUT_FOLDER_ID }} # NEW: INPUT folder
 
     steps:
       - name: Checkout
@@ -38,21 +36,112 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Install Python deps (renderer)
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # Drive libs for fetching + uploading
+          pip install google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
+
+      - name: Fetch scripts from Google Drive → input/scripts/**
+        env:
+          GDRIVE_JSON: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS }}
+          INPUT_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_INPUT_FOLDER_ID }}
+        run: |
+          python - << 'PY'
+          import os, io, re, json, shutil
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaIoBaseDownload
+
+          creds_info = json.loads(os.environ['GDRIVE_JSON'])
+          input_root = os.environ['INPUT_FOLDER_ID'].strip()
+
+          creds = service_account.Credentials.from_service_account_info(
+              creds_info, scopes=['https://www.googleapis.com/auth/drive']
+          )
+          drive = build('drive', 'v3', credentials=creds)
+
+          # Clean local input/scripts to avoid stale files
+          shutil.rmtree('input/scripts', ignore_errors=True)
+
+          def list_children(folder_id, mime=None):
+              q = f"'{folder_id}' in parents and trashed=false"
+              if mime:
+                  q += f" and mimeType='{mime}'"
+              items, pageToken = [], None
+              while True:
+                  resp = drive.files().list(
+                      q=q,
+                      fields="nextPageToken, files(id,name,mimeType)",
+                      pageToken=pageToken
+                  ).execute()
+                  items.extend(resp.get('files', []))
+                  pageToken = resp.get('nextPageToken')
+                  if not pageToken:
+                      break
+                  # safety: limit pages (optional)
+              return items
+
+          def download_file(file, dest_path):
+              os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+              mime = file.get('mimeType')
+              fid  = file['id']
+              buf  = io.BytesIO()
+              if mime == 'application/vnd.google-apps.document':
+                  req = drive.files().export_media(fileId=fid, mimeType='text/plain')
+              else:
+                  req = drive.files().get_media(fileId=fid)
+              downloader = MediaIoBaseDownload(buf, req)
+              done = False
+              while not done:
+                  status, done = downloader.next_chunk()
+              with open(dest_path, 'wb') as f:
+                  f.write(buf.getvalue())
+              print(f"Downloaded: {dest_path}")
+
+          # Prefer subfolders (HM-HI, HT-EN, etc.)
+          subfolders = list_children(input_root, mime="application/vnd.google-apps.folder")
+          downloaded = 0
+
+          # If there are subfolders, use them as channel_code; else parse filename prefix
+          if subfolders:
+              for sf in subfolders:
+                  code = sf['name']  # expected HM-HI / HT-EN / MJ-BN etc.
+                  files = list_children(sf['id'])
+                  for f in files:
+                      mt = f['mimeType']
+                      if mt in ('text/plain','text/markdown','application/vnd.google-apps.document'):
+                          base, ext = os.path.splitext(f['name'])
+                          local_path = os.path.join('input','scripts',code, base + '.txt')
+                          download_file(f, local_path)
+                          downloaded += 1
+                      else:
+                          print(f"Skipping non-text: {f['name']} ({mt})")
+          else:
+              # Fallback: files directly under root; derive code from filename prefix "HM-HI-001.txt"
+              files = list_children(input_root)
+              for f in files:
+                  mt = f['mimeType']
+                  if mt in ('text/plain','text/markdown','application/vnd.google-apps.document'):
+                      base, ext = os.path.splitext(f['name'])
+                      m = re.match(r'^([A-Z]{2}-[A-Z]{2})-', base)
+                      code = m.group(1) if m else 'UNCATEGORIZED'
+                      local_path = os.path.join('input','scripts',code, base + '.txt')
+                      download_file(f, local_path)
+                      downloaded += 1
+                  else:
+                      print(f"Skipping non-text: {f['name']} ({mt})")
+
+          print(f"Fetched {downloaded} script file(s) from Drive.")
+          PY
 
       - name: Render videos
         run: |
           python -c "import sys,os; print('Python OK:', sys.version)"
           python main.py
 
-      - name: Install Google Drive libs
-        run: |
-          pip install google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
-
-      - name: Upload to Google Drive (service account)
+      - name: Upload to Google Drive (Output folder)
         env:
           GDRIVE_JSON: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS }}
           FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
@@ -64,11 +153,9 @@ jobs:
           from googleapiclient.http import MediaFileUpload
 
           creds_info = json.loads(os.environ['GDRIVE_JSON'])
-          folder_id = os.environ['FOLDER_ID'].strip()
-
+          folder_id  = os.environ['FOLDER_ID'].strip()
           creds = service_account.Credentials.from_service_account_info(
-              creds_info,
-              scopes=['https://www.googleapis.com/auth/drive']
+              creds_info, scopes=['https://www.googleapis.com/auth/drive']
           )
           drive = build('drive', 'v3', credentials=creds)
 
@@ -79,13 +166,13 @@ jobs:
 
           for path in files:
               name = os.path.basename(path)
-              meta = {'name': name, 'parents': [folder_id]}
+              meta  = {'name': name, 'parents': [folder_id]}
               media = MediaFileUpload(path, mimetype='video/mp4', resumable=False)
               created = drive.files().create(body=meta, media_body=media, fields='id,name').execute()
               print(f"Uploaded {name} -> fileId {created.get('id')}")
           PY
 
-      - name: Also keep a copy as workflow artifact (optional)
+      - name: Keep a copy as workflow artifact (optional)
         uses: actions/upload-artifact@v4
         with:
           name: mp4-outputs
